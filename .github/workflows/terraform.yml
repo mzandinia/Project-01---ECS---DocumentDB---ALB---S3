@@ -1,0 +1,127 @@
+name: Build Infrastructure via Terraform
+
+on:
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "infra/**"
+  #     - ".github/workflows/terraform.yml"
+  #     - "!infra/ecr.tf"
+  #     - "!backend/**"
+  #     - "!frontend/**"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.12.0
+  TF_STATE_BUCKET: terraform-state-23032101
+  TF_STATE_KEY: terraform.tfstate
+  TF_LOCK_TABLE: terraform-locks-23032101
+
+jobs:
+  check-image:
+    name: Check ECR Repository
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+      repo_url: ${{ steps.check.outputs.repo_url }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check ECR image
+        id: check
+        run: |
+          MAX_RETRIES=60  # 30 minutes with 30s delay
+          RETRY_COUNT=0
+          IMAGE_READY=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$IMAGE_READY" = false ]; do
+            echo "Checking ECR image (Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+
+            # Get the ECR repository name from Terraform state
+            ECR_REPO_NAME=$(aws s3 cp s3://${{ env.TF_STATE_BUCKET }}/${{ env.TF_STATE_KEY }} - | jq -r '.resources[] | select(.type=="aws_ecr_repository") | .instances[0].attributes.name')
+
+            if [ "$ECR_REPO_NAME" ]; then
+              # Get repository URL
+              REPO_URL=$(aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" --query 'repositories[0].repositoryUri' --output text 2>/dev/null)
+
+              if [ "$REPO_URL" ]; then
+                echo "Repository found: $REPO_URL"
+
+                # Check if latest image exists
+                if aws ecr describe-images --repository-name "$ECR_REPO_NAME" --image-ids imageTag=latest &>/dev/null; then
+                  echo "exists=true" >> $GITHUB_OUTPUT
+                  echo "repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+                  echo "✅ Latest image found in ECR repository: $REPO_URL:latest"
+                  IMAGE_READY=true
+                  exit 0
+                else
+                  echo "⚠️ Repository exists but no 'latest' image found"
+                fi
+              fi
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "❌ ECR image not ready after 30 minutes"
+              exit 1
+            fi
+            echo "⏳ Waiting 30 seconds before next attempt..."
+            sleep 30
+          done
+
+  terraform:
+    name: Terraform
+    needs: [check-image]
+    if: needs.check-image.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
+    defaults:
+      run:
+        working-directory: ./infra
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+           -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+           -backend-config="key=${{ env.TF_STATE_KEY }}" \
+           -backend-config="region=${{ env.AWS_REGION }}" \
+           -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+                -var="docdb_master_username=${{ secrets.TF_VAR_docdb_master_username }}" \
+                -var="docdb_master_password=${{ secrets.TF_VAR_docdb_master_password }}"

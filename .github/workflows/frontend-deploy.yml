@@ -1,0 +1,108 @@
+name: Deploy Frontend
+
+on:
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "frontend/**"
+  #     - ".github/workflows/frontend-deploy.yml"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.12.0
+  TF_STATE_BUCKET: terraform-state-23032101
+  TF_STATE_KEY: terraform.tfstate
+  TF_LOCK_TABLE: terraform-locks-23032101
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for Infrastructure and Get Outputs
+        id: tf-outputs
+        working-directory: .
+        run: |
+          echo "Checking infrastructure availability...."
+
+          # Retry for up to 30 minutes (30 attempts with 60-second intervals)
+          MAX_ATTEMPTS=30
+          ATTEMPT=1
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Checking infrastructure..."
+
+            # Check if Terraform state exists and get outputs
+            if aws s3 cp s3://${{ env.TF_STATE_BUCKET }}/${{ env.TF_STATE_KEY }} /tmp/terraform.tfstate 2>/dev/null; then
+
+              # Extract outputs from state
+              S3_BUCKET=$(jq -r '.outputs.frontend_bucket_name.value // empty' /tmp/terraform.tfstate)
+              ALB_DNS=$(jq -r '.outputs.alb_dns_name.value // empty' /tmp/terraform.tfstate)
+
+              # Check if required outputs are available and not null
+              if [ -n "$S3_BUCKET" ] && [ "$S3_BUCKET" != "null" ] ; then
+
+                # Verify S3 bucket exists
+                if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+                  echo "✓ S3 bucket '$S3_BUCKET' is available"
+
+                  # Set environment variables
+                  echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+                  echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+
+                  echo "✅ Infrastructure is ready for deployment"
+                  exit 0
+                else
+                  echo "⏳ S3 bucket '$S3_BUCKET' not accessible yet"
+                fi
+              else
+                echo "⏳ Required infrastructure outputs not available yet"
+                echo "  S3_BUCKET: ${S3_BUCKET:-'not set'}"
+              fi
+            else
+              echo "⏳ Terraform state not found or not accessible"
+            fi
+
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "❌ Infrastructure not ready after 30 minutes. Deployment failed."
+              exit 1
+            fi
+
+            echo "Waiting 60 seconds before next check..."
+            sleep 60
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: "./frontend/package-lock.json"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build Frontend
+        env:
+          VITE_API_URL: http://${{ env.ALB_DNS }}
+        run: npm run build
+
+      - name: Deploy to S3
+        run: |
+          echo "Deploying to S3 bucket: ${{ env.S3_BUCKET }}"
+          aws s3 sync dist/ s3://${{ env.S3_BUCKET }} --delete
